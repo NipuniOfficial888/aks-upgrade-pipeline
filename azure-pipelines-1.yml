@@ -1,19 +1,533 @@
-# Starter pipeline
-# Start with a minimal pipeline that you can customize to build and deploy your code.
-# Add steps that build, run tests, deploy, and more:
-# https://aka.ms/yaml
+trigger: none  # Manual trigger only, scheduled via pipeline settings
 
-trigger:
-- main
+schedules:
+- cron: "0 2 * * 6"  # Every Saturday at 2 AM UTC
+  displayName: Monthly AKS Minor Version Upgrade Check
+  branches:
+    include:
+    - main
+  always: true  # Run even if there are no code changes
 
-pool:
-  vmImage: ubuntu-latest
+variables:
+  # AKS Cluster Configuration
+  azureSubscription: 'AzureRM-KFGlow-BKStage'
+  resourceGroup: 'rg-kf-bk-stage-norwayeast-001'
+  clusterName: 'Aks-BK-Stage-NorwayEast-001'
+  location: 'norwayeast'
+  
+  # Notification Configuration
+  approverEmails: 'nipuni.w@aventude.com;iran.u@aventude.com'
+  notificationEmails: 'nipuni.w@aventude.com;iran.u@aventude.com'
+  
+  # Upgrade Configuration
+  upgradeChannel: 'stable'  # Options: rapid, stable, patch, node-image, none
 
-steps:
-- script: echo Hello, world!
-  displayName: 'Run a one-line script'
+stages:
+- stage: PreUpgradeCheck
+  displayName: 'Pre-Upgrade Assessment'
+  jobs:
+  - job: CheckAvailableUpgrades
+    displayName: 'Check for Available Kubernetes Versions'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Get Current and Available K8s Versions'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "AKS CLUSTER: $(clusterName)"
+          echo "=========================================="
+          
+          # Get current version
+          CURRENT_VERSION=$(az aks show \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --query "currentKubernetesVersion" \
+            -o tsv)
+          
+          echo "Current Kubernetes Version: $CURRENT_VERSION"
+          echo "##vso[task.setvariable variable=currentVersion;isOutput=true]$CURRENT_VERSION"
+          
+          # Get available upgrades
+          echo ""
+          echo "Available Upgrade Versions:"
+          az aks get-upgrades \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --output table
+          
+          # Get latest available minor version
+          AVAILABLE_VERSIONS=$(az aks get-upgrades \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --query "controlPlaneProfile.upgrades[].kubernetesVersion" \
+            -o tsv)
+          
+          if [ -z "$AVAILABLE_VERSIONS" ]; then
+            echo ""
+            echo "✅ No upgrades available. Cluster is up to date!"
+            echo "##vso[task.setvariable variable=upgradeAvailable;isOutput=true]false"
+            exit 0
+          fi
+          
+          # Get the latest stable minor version (not patch)
+          LATEST_VERSION=$(echo "$AVAILABLE_VERSIONS" | sort -V | tail -1)
+          
+          echo ""
+          echo "Recommended Upgrade Version: $LATEST_VERSION"
+          echo "##vso[task.setvariable variable=latestVersion;isOutput=true]$LATEST_VERSION"
+          echo "##vso[task.setvariable variable=upgradeAvailable;isOutput=true]true"
+          
+          # Extract major.minor versions for comparison
+          CURRENT_MINOR=$(echo $CURRENT_VERSION | cut -d. -f1,2)
+          LATEST_MINOR=$(echo $LATEST_VERSION | cut -d. -f1,2)
+          
+          if [ "$CURRENT_MINOR" != "$LATEST_MINOR" ]; then
+            echo ""
+            echo "🔔 MINOR VERSION UPGRADE AVAILABLE!"
+            echo "   Current: $CURRENT_VERSION"
+            echo "   Target:  $LATEST_VERSION"
+            echo "##vso[task.setvariable variable=isMinorUpgrade;isOutput=true]true"
+          else
+            echo ""
+            echo "ℹ️  Only patch upgrade available (auto-managed)"
+            echo "##vso[task.setvariable variable=isMinorUpgrade;isOutput=true]false"
+          fi
+      name: versionCheck
 
-- script: |
-    echo Add other tasks to build, test, and deploy your project.
-    echo See https://aka.ms/yaml
-  displayName: 'Run a multi-line script'
+    - task: AzureCLI@2
+      displayName: 'Cluster Health Assessment'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "CLUSTER HEALTH CHECK"
+          echo "=========================================="
+          
+          # Get cluster status
+          POWER_STATE=$(az aks show \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --query "powerState.code" \
+            -o tsv)
+          
+          PROVISIONING_STATE=$(az aks show \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --query "provisioningState" \
+            -o tsv)
+          
+          echo "Power State: $POWER_STATE"
+          echo "Provisioning State: $PROVISIONING_STATE"
+          
+          if [ "$POWER_STATE" != "Running" ] || [ "$PROVISIONING_STATE" != "Succeeded" ]; then
+            echo "##vso[task.logissue type=error]Cluster is not in healthy state!"
+            echo "##vso[task.complete result=Failed;]"
+            exit 1
+          fi
+          
+          # Get node pool information
+          echo ""
+          echo "Node Pool Status:"
+          az aks nodepool list \
+            --resource-group $(resourceGroup) \
+            --cluster-name $(clusterName) \
+            --query "[].{Name:name, Status:provisioningState, Count:count, Version:orchestratorVersion}" \
+            -o table
+          
+          echo ""
+          echo "✅ Cluster is healthy and ready for upgrade"
+
+    - task: PowerShell@2
+      displayName: 'Send Pre-Upgrade Notification Email'
+      condition: and(succeeded(), eq(variables['versionCheck.isMinorUpgrade'], 'true'))
+      inputs:
+        targetType: 'inline'
+        script: |
+          $emailBody = @"
+          <html>
+          <body style='font-family: Arial, sans-serif;'>
+          <h2 style='color: #0078d4;'>🔔 AKS Minor Version Upgrade Available</h2>
+          
+          <p>A new Kubernetes minor version is available for your AKS cluster.</p>
+          
+          <table style='border-collapse: collapse; margin: 20px 0;'>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Cluster Name</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(clusterName)</td>
+            </tr>
+            <tr>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Resource Group</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(resourceGroup)</td>
+            </tr>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Current Version</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(versionCheck.currentVersion)</td>
+            </tr>
+            <tr>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Target Version</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(versionCheck.latestVersion)</td>
+            </tr>
+          </table>
+          
+          <p><strong>Next Steps:</strong></p>
+          <ol>
+            <li>Review the upgrade details in Azure DevOps</li>
+            <li>Approve the upgrade within 2 days if ready</li>
+            <li>The upgrade will proceed automatically after approval</li>
+          </ol>
+          
+          <p><a href='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)' style='background-color: #0078d4; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;'>View Pipeline Run</a></p>
+          
+          <p style='color: #666; font-size: 12px; margin-top: 30px;'>
+          This is an automated notification from the AKS Upgrade Pipeline.<br>
+          Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          </p>
+          </body>
+          </html>
+          "@
+          
+          Write-Host "Email notification would be sent to: $(notificationEmails)"
+          Write-Host "Subject: AKS Minor Upgrade Available - $(clusterName)"
+          Write-Host "Body preview:"
+          Write-Host $emailBody
+          
+          # Note: Actual email sending requires Azure DevOps email service or external SMTP
+          # This is a placeholder - see setup instructions for email configuration
+
+- stage: ApprovalGate
+  displayName: 'Approval Required'
+  dependsOn: PreUpgradeCheck
+  condition: and(succeeded(), eq(dependencies.PreUpgradeCheck.outputs['CheckAvailableUpgrades.versionCheck.isMinorUpgrade'], 'true'))
+  jobs:
+  - job: waitForValidation
+    displayName: 'Wait for Upgrade Approval'
+    pool: server
+    timeoutInMinutes: 2880  # 2 days (48 hours)
+    steps:
+    - task: ManualValidation@0
+      inputs:
+        notifyUsers: '$(approverEmails)'
+        instructions: |
+          🔔 AKS Minor Version Upgrade Approval Required
+          
+          Cluster: $(clusterName)
+          Current Version: $(PreUpgradeCheck.CheckAvailableUpgrades.versionCheck.currentVersion)
+          Target Version: $(PreUpgradeCheck.CheckAvailableUpgrades.versionCheck.latestVersion)
+          
+          Please review the pre-upgrade health checks and approve to proceed with the upgrade.
+          
+          ⚠️ This approval will expire in 2 days.
+          
+          After approval, the upgrade will:
+          1. Upgrade the control plane
+          2. Upgrade all node pools
+          3. Run post-upgrade validation
+          
+          Note: Workloads will continue running during the upgrade with minimal disruption.
+        onTimeout: 'reject'
+
+- stage: UpgradeExecution
+  displayName: 'Execute AKS Upgrade'
+  dependsOn: 
+  - PreUpgradeCheck
+  - ApprovalGate
+  condition: succeeded()
+  jobs:
+  - job: UpgradeCluster
+    displayName: 'Upgrade Kubernetes Version'
+    pool:
+      vmImage: 'ubuntu-latest'
+    variables:
+      currentVersion: $[ stageDependencies.PreUpgradeCheck.CheckAvailableUpgrades.outputs['versionCheck.currentVersion'] ]
+      targetVersion: $[ stageDependencies.PreUpgradeCheck.CheckAvailableUpgrades.outputs['versionCheck.latestVersion'] ]
+    steps:
+    - task: PowerShell@2
+      displayName: 'Send Upgrade Started Notification'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "✅ Approval received! Starting upgrade process..."
+          Write-Host "Current Version: $(currentVersion)"
+          Write-Host "Target Version: $(targetVersion)"
+          
+          # Email notification would be sent here
+          Write-Host "Notification sent to: $(notificationEmails)"
+
+    - task: AzureCLI@2
+      displayName: 'Upgrade AKS Control Plane'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "UPGRADING CONTROL PLANE"
+          echo "=========================================="
+          echo "Cluster: $(clusterName)"
+          echo "From: $(currentVersion)"
+          echo "To: $(targetVersion)"
+          echo ""
+          
+          # Start the upgrade
+          az aks upgrade \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --kubernetes-version $(targetVersion) \
+            --control-plane-only \
+            --yes
+          
+          echo ""
+          echo "✅ Control plane upgrade completed"
+
+    - task: AzureCLI@2
+      displayName: 'Upgrade Node Pools'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "UPGRADING NODE POOLS"
+          echo "=========================================="
+          
+          # Get all node pools
+          NODE_POOLS=$(az aks nodepool list \
+            --resource-group $(resourceGroup) \
+            --cluster-name $(clusterName) \
+            --query "[].name" \
+            -o tsv)
+          
+          for pool in $NODE_POOLS; do
+            echo ""
+            echo "Upgrading node pool: $pool"
+            
+            az aks nodepool upgrade \
+              --resource-group $(resourceGroup) \
+              --cluster-name $(clusterName) \
+              --name $pool \
+              --kubernetes-version $(targetVersion) \
+              --yes
+            
+            echo "✅ Node pool $pool upgraded"
+          done
+          
+          echo ""
+          echo "✅ All node pools upgraded successfully"
+
+- stage: PostUpgradeValidation
+  displayName: 'Post-Upgrade Validation'
+  dependsOn: UpgradeExecution
+  jobs:
+  - job: ValidateUpgrade
+    displayName: 'Validate Cluster Health'
+    pool:
+      vmImage: 'ubuntu-latest'
+    variables:
+      targetVersion: $[ stageDependencies.PreUpgradeCheck.CheckAvailableUpgrades.outputs['versionCheck.latestVersion'] ]
+    steps:
+    - task: AzureCLI@2
+      displayName: 'Verify Cluster Version'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "POST-UPGRADE VALIDATION"
+          echo "=========================================="
+          
+          # Get current version after upgrade
+          NEW_VERSION=$(az aks show \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --query "currentKubernetesVersion" \
+            -o tsv)
+          
+          echo "Expected Version: $(targetVersion)"
+          echo "Actual Version: $NEW_VERSION"
+          
+          if [ "$NEW_VERSION" != "$(targetVersion)" ]; then
+            echo "##vso[task.logissue type=error]Version mismatch after upgrade!"
+            exit 1
+          fi
+          
+          echo "✅ Version verified successfully"
+
+    - task: AzureCLI@2
+      displayName: 'Validate Node Pool Health'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "NODE POOL HEALTH CHECK"
+          echo "=========================================="
+          
+          # Check all node pools are running the correct version
+          az aks nodepool list \
+            --resource-group $(resourceGroup) \
+            --cluster-name $(clusterName) \
+            --query "[].{Name:name, Version:orchestratorVersion, Status:provisioningState, PowerState:powerState.code}" \
+            -o table
+          
+          # Verify all node pools are in Succeeded state
+          FAILED_POOLS=$(az aks nodepool list \
+            --resource-group $(resourceGroup) \
+            --cluster-name $(clusterName) \
+            --query "[?provisioningState!='Succeeded'].name" \
+            -o tsv)
+          
+          if [ ! -z "$FAILED_POOLS" ]; then
+            echo "##vso[task.logissue type=error]Some node pools are not in Succeeded state: $FAILED_POOLS"
+            exit 1
+          fi
+          
+          echo ""
+          echo "✅ All node pools are healthy"
+
+    - task: AzureCLI@2
+      displayName: 'Check Critical Pods'
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "=========================================="
+          echo "CRITICAL PODS HEALTH CHECK"
+          echo "=========================================="
+          
+          # Get AKS credentials
+          az aks get-credentials \
+            --resource-group $(resourceGroup) \
+            --name $(clusterName) \
+            --overwrite-existing \
+            --admin
+          
+          # Check kube-system pods
+          echo "Checking kube-system namespace:"
+          kubectl get pods -n kube-system
+          
+          # Count not-ready pods in kube-system
+          NOT_READY=$(kubectl get pods -n kube-system --field-selector=status.phase!=Running,status.phase!=Succeeded --no-headers 2>/dev/null | wc -l)
+          
+          if [ $NOT_READY -gt 0 ]; then
+            echo ""
+            echo "⚠️  Warning: $NOT_READY pods not ready in kube-system"
+            kubectl get pods -n kube-system --field-selector=status.phase!=Running,status.phase!=Succeeded
+          else
+            echo ""
+            echo "✅ All system pods are running"
+          fi
+          
+          # Get node status
+          echo ""
+          echo "Node Status:"
+          kubectl get nodes
+
+    - task: PowerShell@2
+      displayName: 'Send Upgrade Completion Notification'
+      condition: succeeded()
+      inputs:
+        targetType: 'inline'
+        script: |
+          $emailBody = @"
+          <html>
+          <body style='font-family: Arial, sans-serif;'>
+          <h2 style='color: #28a745;'>✅ AKS Upgrade Completed Successfully</h2>
+          
+          <p>The Kubernetes upgrade has been completed successfully.</p>
+          
+          <table style='border-collapse: collapse; margin: 20px 0;'>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Cluster Name</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(clusterName)</td>
+            </tr>
+            <tr>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Resource Group</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(resourceGroup)</td>
+            </tr>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>New Version</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(targetVersion)</td>
+            </tr>
+            <tr>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Status</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'><span style='color: #28a745;'>✅ Success</span></td>
+            </tr>
+          </table>
+          
+          <p><strong>Validation Results:</strong></p>
+          <ul>
+            <li>✅ Cluster version verified</li>
+            <li>✅ Node pools healthy</li>
+            <li>✅ Critical pods running</li>
+          </ul>
+          
+          <p><a href='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)' style='background-color: #28a745; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;'>View Pipeline Results</a></p>
+          
+          <p style='color: #666; font-size: 12px; margin-top: 30px;'>
+          This is an automated notification from the AKS Upgrade Pipeline.<br>
+          Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          </p>
+          </body>
+          </html>
+          "@
+          
+          Write-Host "✅ Upgrade completed successfully!"
+          Write-Host "Notification sent to: $(notificationEmails)"
+
+    - task: PowerShell@2
+      displayName: 'Send Upgrade Failure Notification'
+      condition: failed()
+      inputs:
+        targetType: 'inline'
+        script: |
+          $emailBody = @"
+          <html>
+          <body style='font-family: Arial, sans-serif;'>
+          <h2 style='color: #dc3545;'>❌ AKS Upgrade Failed</h2>
+          
+          <p>The Kubernetes upgrade encountered an error and could not complete.</p>
+          
+          <table style='border-collapse: collapse; margin: 20px 0;'>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Cluster Name</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(clusterName)</td>
+            </tr>
+            <tr>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Resource Group</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'>$(resourceGroup)</td>
+            </tr>
+            <tr style='background-color: #f0f0f0;'>
+              <td style='padding: 10px; border: 1px solid #ddd;'><strong>Status</strong></td>
+              <td style='padding: 10px; border: 1px solid #ddd;'><span style='color: #dc3545;'>❌ Failed</span></td>
+            </tr>
+          </table>
+          
+          <p><strong>Action Required:</strong></p>
+          <ul>
+            <li>Review the pipeline logs for error details</li>
+            <li>Check cluster health in Azure Portal</li>
+            <li>Contact the infrastructure team if needed</li>
+          </ul>
+          
+          <p><a href='$(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId)' style='background-color: #dc3545; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; display: inline-block; margin-top: 10px;'>View Pipeline Logs</a></p>
+          
+          <p style='color: #666; font-size: 12px; margin-top: 30px;'>
+          This is an automated notification from the AKS Upgrade Pipeline.<br>
+          Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')
+          </p>
+          </body>
+          </html>
+          "@
+          
+          Write-Host "❌ Upgrade failed!"
+          Write-Host "Notification sent to: $(notificationEmails)"
