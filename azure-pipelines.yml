@@ -10,7 +10,7 @@ schedules:
 
 variables:
   # AKS Cluster Configuration
-  azureSubscription: 'BK_Stage_new_cluster_creation'
+  azureSubscription: 'AzureRM-KFGlow-BKStage'
   resourceGroup: 'rg-kf-bk-stage-norwayeast-001'
   clusterName: 'Aks-BK-Stage-NorwayEast-001'
   location: 'norwayeast'
