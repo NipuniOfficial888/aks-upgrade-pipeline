@@ -1,4 +1,4 @@
-trigger: none  # Manual trigger only, scheduled via pipeline settings
+trigger: none  # Manual trigger only
 
 schedules:
 - cron: "0 2 * * 6"  # Every Saturday at 2 AM UTC
